@@ -8,6 +8,11 @@ import {
 } from './reference';
 import type { SolverResult } from './solver';
 import type { Capacity, CapacityCalendarSegment, Job, JobStatus, Workspace } from './types';
+import {
+  verifyCapacityWitness,
+  type CapacityWitness,
+  type WitnessSegment,
+} from './witness';
 
 export interface StoredSnapshot {
   /**
@@ -25,6 +30,13 @@ export interface StoredSnapshot {
 
 const STORAGE_KEY = 'rail-possession-scheduler:v1';
 const SNAPSHOT_KEY = 'rail-possession-scheduler:snapshot:v1';
+/**
+ * 容量占用见证记录（第四把本地键）。与快照同生共写、独立解析：
+ * 只凭 dataId + workspaceVersion + 入选集合与快照/工作区配对，
+ * 异身份、异版本、异集合、旧格式（无 dataId/无类型标签）或结构损坏的
+ * 记录一律丢弃删除，绝不能附到新方案上展示或下载。
+ */
+const WITNESS_KEY = 'rail-possession-scheduler:witness:v1';
 /**
  * 已采纳的不可变参考方案。与工作区/快照一样仅凭 dataId 配套：
  * 导入新数据或恢复到身份不配套的本地记录时绝不生效（记录直接丢弃）。
@@ -59,6 +71,14 @@ export interface RestoredSession {
    * 损坏或旧格式（无 dataId）的参考记录一律丢弃，绝不作用于新工作区。
    */
   reference: ReferencePlan | null;
+  /**
+   * 仅当见证记录结构合法、且与所配套快照（dataId + 版本 + 容量日历 +
+   * 入选集合逐字段相等）并用当前工作区作业重建见证逐段一致时非 null。
+   * 见证不与快照“共存”地无条件恢复：快照缺失/被判废、身份或版本不匹配、
+   * 旧格式、结构损坏、片段对不上工作区时一律为 null 且记录被清除，
+   * 绝不展示也不进入下载。
+   */
+  witness: CapacityWitness | null;
 }
 
 function safeParse(raw: string | null): unknown | null {
@@ -331,6 +351,119 @@ export function snapshotMatchesWorkspace(snapshot: StoredSnapshot, workspace: Wo
 }
 
 /**
+ * 见证记录的纯结构校验（不依赖工作区；与快照/工作区的逐段核对另见
+ * matchWitness）。任何字段缺失/类型错误、片段不首尾相接、占用为负、
+ * 超容量、余量不自洽、作业清单与占用数不符、入选集合重复都整体拒绝。
+ * 旧格式（无 dataId、无 kind 标签）天然落入拒绝路径，不做迁移。
+ */
+function parseCapacityWitness(data: unknown): CapacityWitness | null {
+  if (typeof data !== 'object' || data === null || Array.isArray(data)) return null;
+  const w = data as Record<string, unknown>;
+  if (w.kind !== 'capacity-witness') return null;
+  if (w.witnessVersion !== 1) return null;
+  if (!isDataId(w.workspaceDataId)) return null;
+  if (!isInt(w.workspaceVersion) || w.workspaceVersion < 1) return null;
+  if (!isInt(w.capacity) || w.capacity < 1 || w.capacity > 8) return null;
+  if (!isNonEmptyString(w.solvedAt)) return null;
+
+  const calendar = parseCalendar(w.capacityCalendar, w.capacity, null);
+  if (calendar === null) return null;
+
+  if (!Array.isArray(w.selectedIds)) return null;
+  const selectedIds: string[] = [];
+  const idsSeen = new Set<string>();
+  for (const id of w.selectedIds) {
+    if (!isNonEmptyString(id) || idsSeen.has(id)) return null;
+    idsSeen.add(id);
+    selectedIds.push(id);
+  }
+
+  if (!Array.isArray(w.segments)) return null;
+  const segments: WitnessSegment[] = [];
+  for (const rawSeg of w.segments) {
+    if (typeof rawSeg !== 'object' || rawSeg === null || Array.isArray(rawSeg)) return null;
+    const s = rawSeg as Record<string, unknown>;
+    if (!isInt(s.start) || !isInt(s.end) || s.end <= s.start) return null;
+    if (!isInt(s.capacity) || s.capacity < 0 || s.capacity > w.capacity) return null;
+    if (!isInt(s.occupancy) || s.occupancy < 0 || s.occupancy > s.capacity) return null;
+    if (!isInt(s.spare) || s.spare !== s.capacity - s.occupancy) return null;
+    if (!Array.isArray(s.jobIds)) return null;
+    const jobIds: string[] = [];
+    const segSeen = new Set<string>();
+    for (const id of s.jobIds) {
+      if (!isNonEmptyString(id) || !idsSeen.has(id) || segSeen.has(id)) return null;
+      segSeen.add(id);
+      jobIds.push(id);
+    }
+    if (jobIds.length !== s.occupancy) return null;
+    // 片段必须按稳定排序（start,end,id）存储
+    for (let i = 1; i < jobIds.length; i++) {
+      if (jobIds[i - 1] > jobIds[i]) return null;
+    }
+    segments.push({
+      start: s.start,
+      end: s.end,
+      capacity: s.capacity,
+      occupancy: s.occupancy,
+      spare: s.spare,
+      jobIds,
+    });
+  }
+  // 片段在见证时间轴上首尾相接（第一段起点、相邻端点、最后一段终点）
+  for (let i = 1; i < segments.length; i++) {
+    if (segments[i].start !== segments[i - 1].end) return null;
+  }
+
+  return {
+    kind: 'capacity-witness',
+    witnessVersion: 1,
+    workspaceDataId: w.workspaceDataId,
+    workspaceVersion: w.workspaceVersion,
+    capacity: w.capacity,
+    capacityCalendar: calendar,
+    selectedIds,
+    solvedAt: w.solvedAt,
+    segments,
+  };
+}
+
+/**
+ * 见证与所配套快照的配对 + 用当前工作区作业重建见证逐段核对。
+ * 配对条件：dataId、版本、容量、日历逐字段相等，selectedIds 与快照
+ * 严格同序同集合（下载 JSON 与页面必须使用同一见证）；随后重建见证，
+ * 任一片段对不上即判废。同身份旧版本快照以“已过期”展示时，其见证
+ * 版本也必须等于快照版本——当前工作区版本的见证绝不附到过期快照上。
+ */
+function matchWitness(
+  witness: CapacityWitness | null,
+  snapshot: StoredSnapshot | null,
+  workspace: Workspace,
+): CapacityWitness | null {
+  if (!witness || !snapshot) return null;
+  if (witness.workspaceDataId !== snapshot.workspaceDataId) return null;
+  if (witness.workspaceVersion !== snapshot.workspaceVersion) return null;
+  if (witness.capacity !== snapshot.capacity) return null;
+  if (!sameCalendar(witness.capacityCalendar, snapshot.capacityCalendar)) return null;
+  if (!sameStringArray(witness.selectedIds, snapshot.result.selectedIds)) return null;
+
+  const ok = verifyCapacityWitness(witness, {
+    dataId: workspace.dataId,
+    version: snapshot.workspaceVersion,
+    capacity: workspace.capacity,
+    calendar: workspace.capacityCalendar,
+    jobs: workspace.jobs,
+    selectedIds: snapshot.result.selectedIds,
+  });
+  return ok ? witness : null;
+}
+
+function sameStringArray(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
  * 同身份但可能是旧版本的快照（用于“已过期”展示）：身份一致、
  * 内容仍是该批数据的一份合法结果即可；版本不同只表示过期，不表示伪造。
  */
@@ -411,7 +544,7 @@ export function clearReference(): void {
  *    与工作区对得上时视为配套，补登同一新 dataId 并立即回写迁移。
  */
 export function restoreSession(): RestoredSession {
-  const empty: RestoredSession = { workspace: null, snapshot: null, reference: null };
+  const empty: RestoredSession = { workspace: null, snapshot: null, reference: null, witness: null };
   let storageOk = true;
   try {
     storageOk = typeof localStorage !== 'undefined';
@@ -423,10 +556,12 @@ export function restoreSession(): RestoredSession {
   let wsRaw: string | null = null;
   let snapRaw: string | null = null;
   let refRaw: string | null = null;
+  let witnessRaw: string | null = null;
   try {
     wsRaw = localStorage.getItem(STORAGE_KEY);
     snapRaw = localStorage.getItem(SNAPSHOT_KEY);
     refRaw = localStorage.getItem(REFERENCE_KEY);
+    witnessRaw = localStorage.getItem(WITNESS_KEY);
   } catch {
     return empty;
   }
@@ -436,20 +571,26 @@ export function restoreSession(): RestoredSession {
   // 旧版本地数据不可能有参考键：无 dataId 的参考记录直接判废
   const parsedReference = parseReference(safeParse(refRaw));
   if (refRaw !== null && !parsedReference) removeItem(REFERENCE_KEY);
+  // 见证是新格式记录：任何结构损坏（含无 dataId/无类型标签的旧形态）
+  // 都沿用现有拒绝规则，整体判废并清除，绝不静默迁移或附到旧方案上。
+  const parsedWitness = parseCapacityWitness(safeParse(witnessRaw));
+  if (witnessRaw !== null && !parsedWitness) removeItem(WITNESS_KEY);
 
   if (!parsedWs) {
     if (wsRaw !== null) removeItem(STORAGE_KEY);
     if (parsedSnap) removeItem(SNAPSHOT_KEY); // 没有工作区的快照无法配对，不能下发
     if (parsedReference) removeItem(REFERENCE_KEY);
+    if (parsedWitness) removeItem(WITNESS_KEY); // 孤儿见证与孤儿快照同样丢弃
     return empty;
   }
 
   if (!parsedSnap) {
     if (snapRaw !== null) removeItem(SNAPSHOT_KEY); // 工作区有效，快照损坏：保工作区、弃快照
+    if (parsedWitness) removeItem(WITNESS_KEY); // 没有可配套快照：见证不得独立下发
     const dataId = parsedWs.legacy ? newDataId() : parsedWs.workspace.dataId!;
     const workspace = { ...parsedWs.workspace, dataId };
     if (parsedWs.legacy) persistWorkspace(workspace); // 旧工作区补登身份并立即回写
-    return { workspace, snapshot: null, reference: matchReference(parsedReference, dataId) };
+    return { workspace, snapshot: null, reference: matchReference(parsedReference, dataId), witness: null };
   }
 
   const { snapshot, legacy: snapLegacy } = parsedSnap;
@@ -458,10 +599,11 @@ export function restoreSession(): RestoredSession {
   // 只有“两份都是旧数据”或“两份都是新数据且 dataId 相同”才可能配套
   if (wsLegacy !== snapLegacy || (!wsLegacy && parsedWs.workspace.dataId !== snapshot.workspaceDataId)) {
     removeItem(SNAPSHOT_KEY); // 异身份：可能是单键写入或旧快照残留，丢弃
+    if (parsedWitness) removeItem(WITNESS_KEY); // 快照既不配套，旧见证绝不能附到新方案
     const dataId = wsLegacy ? newDataId() : parsedWs.workspace.dataId!;
     const workspace = { ...parsedWs.workspace, dataId };
     if (wsLegacy) persistWorkspace(workspace);
-    return { workspace, snapshot: null, reference: matchReference(parsedReference, dataId) };
+    return { workspace, snapshot: null, reference: matchReference(parsedReference, dataId), witness: null };
   }
 
   const workspace: Workspace = wsLegacy
@@ -478,8 +620,9 @@ export function restoreSession(): RestoredSession {
 
   if (!contentOk) {
     removeItem(SNAPSHOT_KEY);
+    if (parsedWitness) removeItem(WITNESS_KEY);
     if (wsLegacy) persistWorkspace(workspace);
-    return { workspace, snapshot: null, reference: matchReference(parsedReference, workspace.dataId) };
+    return { workspace, snapshot: null, reference: matchReference(parsedReference, workspace.dataId), witness: null };
   }
 
   if (wsLegacy) {
@@ -487,13 +630,26 @@ export function restoreSession(): RestoredSession {
     snapshot.workspaceDataId = workspace.dataId;
     persistWorkspace(workspace);
     persistSnapshot(snapshot);
+    // 旧快照迁移时没有任何合法见证可迁移（旧记录无类型标签，已在上方判废）
+    if (parsedWitness) removeItem(WITNESS_KEY);
+    return {
+      workspace,
+      snapshot,
+      reference: matchReference(parsedReference, workspace.dataId),
+      witness: null,
+    };
   }
 
-  // 同身份：版本相同即当前结果；版本较旧时由界面标记“已过期”（不冒充当前）
+  // 同身份：版本相同即当前结果；版本较旧时由界面标记“已过期”（不冒充当前）。
+  // 见证同样只与这份快照配套（版本等于快照版本、入选集合逐字段相等、
+  // 按当前工作区作业重建逐段一致）；对不上就清除，绝不把旧见证附到新方案。
+  const witness = matchWitness(parsedWitness, snapshot, workspace);
+  if (parsedWitness && !witness) removeItem(WITNESS_KEY);
   return {
     workspace,
     snapshot,
     reference: matchReference(parsedReference, workspace.dataId),
+    witness,
   };
 }
 
@@ -546,6 +702,37 @@ export function persistSnapshot(snapshot: StoredSnapshot): void {
   } catch {
     // 忽略：结果持久化失败不影响当前会话
   }
+}
+
+/**
+ * 持久化容量占用见证（与快照同生：每次成功求解在快照之后写入）。
+ * 存储失败（配额/隐私模式）不影响当前会话的展示与下载；
+ * 恢复时若只有快照没有见证，见证缺省为 null，绝不临时拼凑一份。
+ */
+export function persistWitness(witness: CapacityWitness): void {
+  try {
+    localStorage.setItem(WITNESS_KEY, JSON.stringify(witness));
+  } catch {
+    // 忽略：见证持久化失败不影响当前会话
+  }
+}
+
+/**
+ * 单独加载见证（测试/工具用）：仅做结构校验，不与任何快照/工作区配对。
+ * 界面恢复必须走 restoreSession()，避免跨批次/跨版本见证冒充当前结果。
+ */
+export function loadWitness(): CapacityWitness | null {
+  try {
+    const raw = localStorage.getItem(WITNESS_KEY);
+    return parseCapacityWitness(safeParse(raw));
+  } catch {
+    return null;
+  }
+}
+
+/** 丢弃见证记录（主要供测试与显式清理使用）。 */
+export function clearWitness(): void {
+  removeItem(WITNESS_KEY);
 }
 
 /**
@@ -604,11 +791,17 @@ function toDiffJson(items: ReferenceDiff['retained']): ReferenceDiffJson[] {
  * referenceDiff 非空（已采纳且身份配套的参考）时，结果页展示的
  * 保留/撤下/新增三类成员原样进入下载文件，屏幕与下载来自同一份
  * computeReferenceDiff 结果，不存在两套计算路径。
+ *
+ * witness 非空且与快照严格配套（dataId/版本/容量/日历/selectedIds
+ * 逐字段相等）时，下载文件附带 capacityWitness 区块——它与页面上的
+ * 容量占用见证是同一个只读对象。不配套或缺省时该字段省略，旧格式
+ * 下载（以及旧快照）结构逐项不变。
  */
 export function buildResultJson(
   snapshot: StoredSnapshot,
   reference: ReferencePlan | null = null,
   referenceDiff: ReferenceDiff | null = null,
+  witness: CapacityWitness | null = null,
 ): {
   dataId?: string;
   capacity: number;
@@ -621,6 +814,7 @@ export function buildResultJson(
   selectedCount: number;
   selectedIds: string[];
   reference?: ReferenceBlockJson;
+  capacityWitness?: WitnessBlockJson;
 } {
   const base = {
     // undefined 在 JSON.stringify 时自动省略：旧快照下载结构保持原样
@@ -636,19 +830,62 @@ export function buildResultJson(
     selectedCount: snapshot.result.selectedCount,
     selectedIds: snapshot.result.selectedIds,
   };
-  if (!reference || !referenceDiff) return base;
+  if (!reference || !referenceDiff) {
+    return witness && witnessMatchesSnapshot(witness, snapshot)
+      ? { ...base, capacityWitness: toWitnessBlock(witness) }
+      : base;
+  }
+  const referenceBlock: ReferenceBlockJson = {
+    dataId: reference.workspaceDataId,
+    adoptedAt: reference.adoptedAt,
+    workspaceVersion: reference.workspaceVersion,
+    retained: toDiffJson(referenceDiff.retained),
+    removed: toDiffJson(referenceDiff.removed),
+    added: toDiffJson(referenceDiff.added),
+    deletedReference: referenceDiff.deletedReference.map((m) => ({ ...m })),
+    diffCount: referenceDiff.diffCount,
+  };
+  return witness && witnessMatchesSnapshot(witness, snapshot)
+    ? { ...base, reference: referenceBlock, capacityWitness: toWitnessBlock(witness) }
+    : { ...base, reference: referenceBlock };
+}
+
+/** 下载 JSON 中的容量占用见证区块：与页面见证面板来自同一对象。 */
+export interface WitnessBlockJson {
+  kind: 'capacity-witness';
+  witnessVersion: 1;
+  dataId: string;
+  workspaceVersion: number;
+  capacity: number;
+  capacityCalendar: CapacityCalendarSegment[];
+  selectedIds: string[];
+  solvedAt: string;
+  segments: WitnessSegment[];
+}
+
+/** 见证是否与快照严格配套（下载/展示前的最后一道身份与集合闸门）。 */
+export function witnessMatchesSnapshot(witness: CapacityWitness, snapshot: StoredSnapshot): boolean {
+  if (witness.kind !== 'capacity-witness' || witness.witnessVersion !== 1) return false;
+  if (witness.workspaceDataId !== snapshot.workspaceDataId) return false;
+  if (witness.workspaceVersion !== snapshot.workspaceVersion) return false;
+  if (witness.capacity !== snapshot.capacity) return false;
+  if (!sameCalendar(witness.capacityCalendar, snapshot.capacityCalendar)) return false;
+  if (!sameStringArray(witness.selectedIds, snapshot.result.selectedIds)) return false;
+  if (witness.solvedAt !== snapshot.solvedAt) return false;
+  return true;
+}
+
+function toWitnessBlock(witness: CapacityWitness): WitnessBlockJson {
   return {
-    ...base,
-    reference: {
-      dataId: reference.workspaceDataId,
-      adoptedAt: reference.adoptedAt,
-      workspaceVersion: reference.workspaceVersion,
-      retained: toDiffJson(referenceDiff.retained),
-      removed: toDiffJson(referenceDiff.removed),
-      added: toDiffJson(referenceDiff.added),
-      deletedReference: referenceDiff.deletedReference.map((m) => ({ ...m })),
-      diffCount: referenceDiff.diffCount,
-    },
+    kind: 'capacity-witness',
+    witnessVersion: 1,
+    dataId: witness.workspaceDataId,
+    workspaceVersion: witness.workspaceVersion,
+    capacity: witness.capacity,
+    capacityCalendar: witness.capacityCalendar.map((seg) => ({ ...seg })),
+    selectedIds: [...witness.selectedIds],
+    solvedAt: witness.solvedAt,
+    segments: witness.segments.map((seg) => ({ ...seg, jobIds: [...seg.jobIds] })),
   };
 }
 

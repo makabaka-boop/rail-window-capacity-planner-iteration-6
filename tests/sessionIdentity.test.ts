@@ -148,7 +148,7 @@ describe('单键写入：只有一份记录时永远不混合恢复', () => {
       length: 0,
     } as Storage;
     expect(() => restoreSession()).not.toThrow();
-    expect(restoreSession()).toEqual({ workspace: null, snapshot: null, reference: null });
+    expect(restoreSession()).toEqual({ workspace: null, snapshot: null, reference: null, witness: null });
   });
 });
 

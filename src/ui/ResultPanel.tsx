@@ -1,8 +1,10 @@
 import { useMemo } from 'react';
-import { buildResultJson, type StoredSnapshot } from '../core/persistence';
+import { buildResultJson, witnessMatchesSnapshot, type StoredSnapshot } from '../core/persistence';
 import { computeReferenceDiff, type ReferenceDiff, type ReferencePlan } from '../core/reference';
+import type { CapacityWitness } from '../core/witness';
 import type { Job } from '../core/types';
 import type { SolverStatus } from './useSolverWorker';
+import { WitnessPanel } from './WitnessPanel';
 
 interface Props {
   status: SolverStatus;
@@ -53,6 +55,13 @@ export function ResultPanel({
     [snapshot, reference, jobs],
   );
 
+  // 见证与快照同一道身份闸门，且必须逐字段配套（含版本与入选集合）：
+  // 异身份、旧版本、Worker 迟到或恢复所得的不配套见证绝不能附到当前方案。
+  const witness: CapacityWitness | null = useMemo(() => {
+    if (!snapshot || !status.witness) return null;
+    return witnessMatchesSnapshot(status.witness, snapshot) ? status.witness : null;
+  }, [snapshot, status.witness]);
+
   // 采纳来源必须是当前版本的成功结果：过期/计算中/失败均不允许。
   const adoptable =
     snapshot !== null &&
@@ -63,7 +72,7 @@ export function ResultPanel({
   const download = useMemo(() => {
     if (!snapshot) return null;
     return () => {
-      const payload = buildResultJson(snapshot, reference, diff);
+      const payload = buildResultJson(snapshot, reference, diff, witness);
       const blob = new Blob([JSON.stringify(payload, null, 2)], {
         type: 'application/json',
       });
@@ -74,7 +83,7 @@ export function ResultPanel({
       a.click();
       URL.revokeObjectURL(url);
     };
-  }, [snapshot, reference, diff]);
+  }, [snapshot, reference, diff, witness]);
 
   return (
     <section className="panel result-panel">
@@ -160,8 +169,11 @@ export function ResultPanel({
               <>　·　耗时 {status.lastElapsedMs} ms</>
             )}
           </div>
-          {diff && reference && <ReferenceChanges diff={diff} snapshot={snapshot} reference={reference} />}
-          <SelectedIds snapshot={snapshot} reference={reference} diff={diff} />
+          {diff && reference && (
+            <ReferenceChanges diff={diff} snapshot={snapshot} reference={reference} witness={witness} />
+          )}
+          <WitnessPanel witness={witness} jobs={jobs} />
+          <SelectedIds snapshot={snapshot} reference={reference} diff={diff} witness={witness} />
         </div>
       )}
     </section>
@@ -190,12 +202,14 @@ function ReferenceChanges({
   diff,
   snapshot,
   reference,
+  witness,
 }: {
   diff: ReferenceDiff;
   snapshot: StoredSnapshot;
   reference: ReferencePlan;
+  witness: CapacityWitness | null;
 }) {
-  const payload = buildResultJson(snapshot, reference, diff);
+  const payload = buildResultJson(snapshot, reference, diff, witness);
   const screenRetained = diff.retained.map(memberLine);
   const downloadRetained = payload.reference!.retained.map(memberLine);
   const screenRemoved = diff.removed.map(memberLine);
@@ -274,20 +288,30 @@ function SelectedIds({
   snapshot,
   reference,
   diff,
+  witness,
 }: {
   snapshot: StoredSnapshot;
   reference: ReferencePlan | null;
   diff: ReferenceDiff | null;
+  witness: CapacityWitness | null;
 }) {
   const ids = snapshot.result.selectedIds;
-  const jsonPayload = buildResultJson(snapshot, reference, diff);
+  const jsonPayload = buildResultJson(snapshot, reference, diff, witness);
   const jsonIds = jsonPayload.selectedIds;
   // 屏幕集合与下载一致性断言（同数据源，正常情况下恒等）
   const consistent = ids.length === jsonIds.length && ids.every((v, i) => v === jsonIds[i]);
+  // 下载中的见证与屏幕见证同一对象：入选集合与绑定身份逐项一致
+  const witnessConsistent =
+    witness === null ||
+    (jsonPayload.capacityWitness !== undefined &&
+      jsonPayload.capacityWitness.selectedIds.length === witness.selectedIds.length &&
+      jsonPayload.capacityWitness.selectedIds.every((v, i) => v === witness.selectedIds[i]) &&
+      jsonPayload.capacityWitness.segments.length === witness.segments.length);
   return (
     <details className="selected-details">
       <summary>
-        入选集合（{ids.length} 项{consistent ? '，与下载 JSON 一致' : '，与下载不一致！'}）
+        入选集合（{ids.length} 项{consistent ? '，与下载 JSON 一致' : '，与下载不一致！'}
+        {witness ? witnessConsistent ? '；容量见证已随下载附带' : '；容量见证与下载不一致！' : ''}）
       </summary>
       <textarea readOnly rows={10} value={JSON.stringify(ids, null, 2)} spellCheck={false} />
     </details>

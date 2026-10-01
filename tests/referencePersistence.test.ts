@@ -188,7 +188,7 @@ describe('参考方案：身份绑定——导入新数据/异身份记录绝不
     const w = makeWorkspace([{ id: 'a', start: 0, end: 10, benefit: 5 }]);
     persistReference(referenceFor(w, ['a']));
     const session = restoreSession();
-    expect(session).toEqual({ workspace: null, snapshot: null, reference: null });
+    expect(session).toEqual({ workspace: null, snapshot: null, reference: null, witness: null });
     expect(storage.has(REF_KEY)).toBe(false);
   });
 });
@@ -287,7 +287,7 @@ describe('参考方案：单键写入 / 存储失败 / 异步旧结果', () => {
     const w = makeWorkspace([{ id: 'a', start: 0, end: 10, benefit: 5 }]);
     persistReference(referenceFor(w, ['a']));
     // 不写工作区
-    expect(restoreSession()).toEqual({ workspace: null, snapshot: null, reference: null });
+    expect(restoreSession()).toEqual({ workspace: null, snapshot: null, reference: null, witness: null });
     expect(storage.has(REF_KEY)).toBe(false);
   });
 

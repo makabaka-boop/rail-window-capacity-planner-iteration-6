@@ -15,13 +15,14 @@ export default function App() {
   const [initialSession] = useState(() =>
     typeof localStorage !== 'undefined'
       ? restoreSession()
-      : { workspace: null, snapshot: null, reference: null },
+      : { workspace: null, snapshot: null, reference: null, witness: null },
   );
   const [workspace, setWorkspace] = useState<Workspace | null>(initialSession.workspace);
   const [toast, setToast] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
   const { status, run, adoptReference, resetReference } = useSolverWorker({
     snapshot: initialSession.snapshot,
     reference: initialSession.reference,
+    witness: initialSession.witness,
   });
   // 始终指向最新工作区，避免结果面板按钮闭包捕获旧对象
   const workspaceRef = useRef<Workspace | null>(null);

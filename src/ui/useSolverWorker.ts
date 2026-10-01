@@ -3,7 +3,9 @@ import {
   persistReference,
   clearReference,
   persistSnapshot,
+  persistWitness,
   resultMatchesWorkspace,
+  witnessMatchesSnapshot,
   type StoredSnapshot,
 } from '../core/persistence';
 import {
@@ -11,6 +13,7 @@ import {
   referenceMembersFromSelection,
   type ReferencePlan,
 } from '../core/reference';
+import { buildCapacityWitness, type CapacityWitness } from '../core/witness';
 import type { Workspace } from '../core/types';
 import type { SolveRequest, SolveResponse } from '../solver/solver.worker';
 import { decodeSolveResponse, isCurrentResponse } from './messages';
@@ -47,6 +50,13 @@ export interface SolverStatus {
    * 导入新数据（dataId 变化）时立即清空并删除本地记录。
    */
   reference: ReferencePlan | null;
+  /**
+   * 当前快照的只读容量占用见证；只可能与 snapshot 严格配套
+   * （同 dataId、同版本、同日历、同入选集合且按工作区作业重建逐段一致）。
+   * 见证生成失败时 snapshot 也不会落地——不存在“可下发但无见证”的
+   * 当前结果；旧结果（含旧版本/恢复所得）无见证时为 null。
+   */
+  witness: CapacityWitness | null;
 }
 
 /**
@@ -58,6 +68,7 @@ export interface SolverStatus {
 export function useSolverWorker(initial: {
   snapshot: StoredSnapshot | null;
   reference: ReferencePlan | null;
+  witness: CapacityWitness | null;
 }) {
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef(0);
@@ -80,9 +91,12 @@ export function useSolverWorker(initial: {
     lastElapsedMs: null,
     // 参考同样来自 restoreSession 的严格 dataId 配对，异身份记录已被丢弃。
     reference: initial.reference,
+    // 见证来自 restoreSession：结构校验 + 与快照逐字段配对 + 按当前工作区
+    // 作业重建逐段一致后才会出现在这里；恢复不到时为 null（旧快照无见证）。
+    witness: initial.witness,
   }));
 
-  /** 失败收敛：保留最后一份有效快照与参考，回到可重试状态。 */
+  /** 失败收敛：保留最后一份有效快照、参考与见证，回到可重试状态。 */
   const failWith = useCallback((message: string) => {
     setStatus((prev) => ({
       state: 'error',
@@ -91,6 +105,7 @@ export function useSolverWorker(initial: {
       errorMessage: message,
       lastElapsedMs: prev.lastElapsedMs,
       reference: prev.reference,
+      witness: prev.witness,
     }));
   }, []);
 
@@ -117,7 +132,6 @@ export function useSolverWorker(initial: {
           failWith('求解消息传输失败，可重新计算');
         }
       };
-
       worker.onmessage = (ev: MessageEvent<unknown>) => {
         // 解码失败不能抛进事件循环，也不能让状态永远停在计算中
         const msg: SolveResponse | null = decodeSolveResponse(ev.data);
@@ -136,6 +150,7 @@ export function useSolverWorker(initial: {
             errorMessage: msg.message,
             lastElapsedMs: prev.lastElapsedMs,
             reference: prev.reference,
+            witness: prev.witness,
           }));
           return;
         }
@@ -160,18 +175,50 @@ export function useSolverWorker(initial: {
           return;
         }
 
+        const solvedAt = new Date().toISOString();
         const snapshot: StoredSnapshot = {
           workspaceDataId: pending.dataId,
           workspaceVersion: pending.version,
           capacity: msg.result.capacity,
           capacityCalendar: pending.calendar,
-          solvedAt: new Date().toISOString(),
+          solvedAt,
           result: msg.result,
         };
+
+        // 容量占用见证是“可下发当前结果”的只读组成部分：与快照由同一次
+        // 成功响应、同一入选集合、同一日历和同一时间戳生成。生成/自检
+        // 失败绝不伪装成可下发结果——不落地快照、不展示、不可下载，
+        // 但也不清空上一次成功结果（状态收敛到 error，可直接重算）。
+        let witness: CapacityWitness;
+        try {
+          witness = buildCapacityWitness({
+            jobs: pendingWorkspace.jobs,
+            capacity: pendingWorkspace.capacity,
+            calendar: pendingWorkspace.capacityCalendar,
+            selectedIds: msg.result.selectedIds,
+            workspaceDataId: pending.dataId,
+            workspaceVersion: pending.version,
+            solvedAt,
+          });
+        } catch (err) {
+          pendingRef.current = null;
+          failWith(
+            `容量占用见证生成失败，本次结果不予下发（${err instanceof Error ? err.message : String(err)}）；请重新计算`,
+          );
+          return;
+        }
+        // 生成后再与快照做一次逐字段配对（含时间戳），不通过同样拒绝落地
+        if (!witnessMatchesSnapshot(witness, snapshot)) {
+          pendingRef.current = null;
+          failWith('容量占用见证与求解结果不配套，本次结果不予下发；请重新计算');
+          return;
+        }
+
         pendingRef.current = null;
-        // 工作区先写、快照后写：若只成功写入快照，恢复时没有同身份
-        // 工作区可配对，孤儿快照会被 restoreSession 直接丢弃
+        // 工作区先写、快照后写、见证最后写：若只成功写入快照/见证，恢复时
+        // 没有同身份工作区可配对，孤儿记录会被 restoreSession 直接丢弃
         persistSnapshot(snapshot);
+        persistWitness(witness);
         setStatus((prev) => ({
           state: 'success',
           snapshot,
@@ -179,6 +226,7 @@ export function useSolverWorker(initial: {
           errorMessage: null,
           lastElapsedMs: msg.elapsedMs,
           reference: prev.reference,
+          witness,
         }));
       };
     };
@@ -280,9 +328,9 @@ export function useSolverWorker(initial: {
         reference: reference ? activeReferenceMembers(reference, workspace.jobs) : [],
       };
       setStatus((prev) => ({
-        // 导入新数据（dataId 变化）：旧身份快照立即从状态中消失，
+        // 导入新数据（dataId 变化）：旧身份快照与见证立即从状态中消失，
         // 绝不与新工作区同屏展示/可下载；同身份重算则保留旧版本结果
-        // （界面按版本标记“已过期”）。
+        // （界面按版本标记“已过期”），其见证也只可能与那份旧快照配套。
         state: 'computing',
         snapshot:
           prev.snapshot && prev.snapshot.workspaceDataId === workspace.dataId
@@ -294,6 +342,13 @@ export function useSolverWorker(initial: {
         reference:
           prev.reference && prev.reference.workspaceDataId === workspace.dataId
             ? prev.reference
+            : null,
+        witness:
+          prev.witness &&
+          prev.snapshot &&
+          prev.witness.workspaceDataId === workspace.dataId &&
+          prev.witness.workspaceVersion === prev.snapshot.workspaceVersion
+            ? prev.witness
             : null,
       }));
       try {
