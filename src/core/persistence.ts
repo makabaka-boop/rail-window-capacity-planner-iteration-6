@@ -1,5 +1,6 @@
 import { buildCapacityGrid } from './capacityCalendar';
 import { newDataId, isDataId } from './identity';
+import { witnessMatchesSnapshot, type CapacityWitness } from './occupancyWitness';
 import {
   normalizeReferenceMembers,
   type ReferenceDiff,
@@ -604,11 +605,19 @@ function toDiffJson(items: ReferenceDiff['retained']): ReferenceDiffJson[] {
  * referenceDiff 非空（已采纳且身份配套的参考）时，结果页展示的
  * 保留/撤下/新增三类成员原样进入下载文件，屏幕与下载来自同一份
  * computeReferenceDiff 结果，不存在两套计算路径。
+ *
+ * witness 非空（容量占用见证）时原样进入下载文件的 occupancyWitness
+ * 字段：屏幕与下载使用同一个已通过 verifyWitnessAgainstSnapshot 核对的
+ * 见证对象。见证与快照的三要素（dataId/版本/入选集合）不匹配时直接
+ * 抛错——下载失败关闭，绝不让旧见证（约束变化前、异身份恢复或
+ * Worker 迟到响应所生成）附到当前方案上。省略该参数时下载结构与
+ * 旧版完全相同（无 occupancyWitness 字段）。
  */
 export function buildResultJson(
   snapshot: StoredSnapshot,
   reference: ReferencePlan | null = null,
   referenceDiff: ReferenceDiff | null = null,
+  witness: CapacityWitness | null = null,
 ): {
   dataId?: string;
   capacity: number;
@@ -621,7 +630,11 @@ export function buildResultJson(
   selectedCount: number;
   selectedIds: string[];
   reference?: ReferenceBlockJson;
+  occupancyWitness?: CapacityWitness;
 } {
+  if (witness !== null && !witnessMatchesSnapshot(witness, snapshot)) {
+    throw new Error('容量占用见证与当前结果不配套（数据身份/版本/入选集合不一致），拒绝下载');
+  }
   const base = {
     // undefined 在 JSON.stringify 时自动省略：旧快照下载结构保持原样
     dataId: snapshot.workspaceDataId,
@@ -636,9 +649,11 @@ export function buildResultJson(
     selectedCount: snapshot.result.selectedCount,
     selectedIds: snapshot.result.selectedIds,
   };
-  if (!reference || !referenceDiff) return base;
+  const withWitness =
+    witness === null ? base : { ...base, occupancyWitness: witness };
+  if (!reference || !referenceDiff) return withWitness;
   return {
-    ...base,
+    ...withWitness,
     reference: {
       dataId: reference.workspaceDataId,
       adoptedAt: reference.adoptedAt,

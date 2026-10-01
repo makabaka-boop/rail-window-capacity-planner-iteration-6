@@ -471,3 +471,177 @@ textarea {
 .change-list code {
   font-size: 12px;
 }
+
+/* ---- 容量占用见证 ---- */
+.witness-details {
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.witness-details > summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+
+.witness-meta {
+  margin: 8px 0;
+  word-break: break-all;
+}
+
+.witness-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.witness-toolbar input {
+  background: #0c1117;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 13px;
+  width: 90px;
+}
+
+.witness-locate-msg {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.witness-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+}
+
+@media (max-width: 900px) {
+  .witness-body {
+    grid-template-columns: 1fr;
+  }
+}
+
+.witness-viewport {
+  height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #0c1117;
+}
+
+.witness-table {
+  position: absolute;
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.witness-table td {
+  height: 30px;
+  padding: 2px 8px;
+  border-bottom: 1px solid #1b2531;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 12px;
+}
+
+.witness-row {
+  cursor: pointer;
+}
+
+.witness-row:hover td {
+  background: rgba(79, 156, 249, 0.08);
+}
+
+.witness-row.selected td {
+  background: rgba(79, 156, 249, 0.18);
+}
+
+.witness-row.closed td {
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.witness-row.closed.selected td {
+  background: rgba(248, 81, 73, 0.2);
+}
+
+.witness-row.full:not(.closed):not(.selected) td {
+  background: rgba(210, 153, 34, 0.07);
+}
+
+.w-idx {
+  width: 46px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.w-time {
+  width: 30%;
+  font-family: var(--mono);
+}
+
+.w-num {
+  width: 60px;
+  text-align: right;
+  font-family: var(--mono);
+}
+
+.w-jobs {
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.w-job-tag {
+  display: inline-block;
+  margin: 0 4px 2px 0;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  background: var(--panel-2);
+}
+
+.witness-detail {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--panel-2);
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.witness-detail-head {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.witness-detail-metrics {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  font-size: 12.5px;
+}
+
+.witness-detail-list-title {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 6px 0 4px;
+}
+
+.witness-job-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 4px;
+  font-size: 12.5px;
+}
+
+.w-locate-btn {
+  padding: 1px 8px;
+  font-size: 12px;
+}

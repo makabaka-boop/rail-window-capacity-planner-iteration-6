@@ -19,7 +19,7 @@ export interface CapacityGrid {
 export function buildCapacityGrid(
   jobs: { start: number; end: number }[],
   capacity: number,
-  calendar: CapacityCalendarSegment[],
+  calendar: readonly CapacityCalendarSegment[],
 ): CapacityGrid {
   const set = new Set<number>();
   for (const job of jobs) {

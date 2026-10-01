@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ImportPanel, type ImportSuccess } from './ImportPanel';
-import { JobsTable } from './JobsTable';
+import { JobsTable, type LocateRequest } from './JobsTable';
 import { ResultPanel } from './ResultPanel';
 import { useSolverWorker } from './useSolverWorker';
 import { createWorkspace, createDepthIndex, applyStatusChange } from '../core/workspace';
@@ -19,6 +19,9 @@ export default function App() {
   );
   const [workspace, setWorkspace] = useState<Workspace | null>(initialSession.workspace);
   const [toast, setToast] = useState<{ kind: 'error' | 'ok'; text: string } | null>(null);
+  // 容量占用见证片段 -> 作业表定位请求（每次 nonce 递增）
+  const [locateRequest, setLocateRequest] = useState<LocateRequest | null>(null);
+  const locateNonceRef = useRef(0);
   const { status, run, adoptReference, resetReference } = useSolverWorker({
     snapshot: initialSession.snapshot,
     reference: initialSession.reference,
@@ -126,6 +129,11 @@ export default function App() {
     return c;
   }, [workspace]);
 
+  const handleLocateJob = useCallback((id: string) => {
+    locateNonceRef.current += 1;
+    setLocateRequest({ id, nonce: locateNonceRef.current });
+  }, []);
+
   return (
     <div className="app">
       <header className="app-header">
@@ -174,6 +182,7 @@ export default function App() {
             jobs={workspace.jobs}
             selectedIds={selectedIds}
             onChangeStatus={handleChangeStatus}
+            locateRequest={locateRequest}
           />
 
           <ResultPanel
@@ -199,6 +208,7 @@ export default function App() {
                 setToast({ kind: 'error', text: outcome.reason ?? '采纳失败' });
               }
             }}
+            onLocateJob={handleLocateJob}
           />
         </>
       ) : (

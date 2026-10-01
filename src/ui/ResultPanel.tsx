@@ -1,6 +1,12 @@
 import { useMemo } from 'react';
 import { buildResultJson, type StoredSnapshot } from '../core/persistence';
 import { computeReferenceDiff, type ReferenceDiff, type ReferencePlan } from '../core/reference';
+import {
+  buildOccupancyWitness,
+  verifyWitnessAgainstSnapshot,
+  type CapacityWitness,
+} from '../core/occupancyWitness';
+import { WitnessPanel } from './WitnessPanel';
 import type { Job } from '../core/types';
 import type { SolverStatus } from './useSolverWorker';
 
@@ -11,6 +17,8 @@ interface Props {
   workspaceVersion: number;
   onRecompute: () => void;
   onAdopt: () => void;
+  /** 在作业表中定位某作业（见证片段内点击作业时使用） */
+  onLocateJob: (id: string) => void;
 }
 
 /**
@@ -32,6 +40,7 @@ export function ResultPanel({
   workspaceVersion,
   onRecompute,
   onAdopt,
+  onLocateJob,
 }: Props) {
   const rawSnapshot = status.snapshot;
   // 数据身份闸门：不匹配的快照（理论上状态机已剔除）在此再挡一次，
@@ -53,6 +62,43 @@ export function ResultPanel({
     [snapshot, reference, jobs],
   );
 
+  // 容量占用见证：只对「当前版本」的同身份成功结果只读生成一次，屏幕与
+  // 下载共用同一个 witness 对象。见证只属于生成它的 dataId + 版本 + 入选集合：
+  // 约束变化后重算、异身份恢复或 Worker 迟到响应都会换成另一份快照，
+  // 这里随之生成另一份见证；生成/核对失败时 witness=null 且记录原因，
+  // 下载按钮禁用——绝不伪装成可下发的当前结果。
+  // 过期（同身份旧版本）结果只展示指标并提示重算：不生成见证、不可下载，
+  // 避免旧版本的占用情况被误当成当前可下发方案。
+  const witnessState = useMemo(
+    () => {
+      if (!snapshot || stale || snapshot.workspaceDataId === undefined) {
+        return { witness: null as CapacityWitness | null, error: null as string | null };
+      }
+      try {
+        const witness = buildOccupancyWitness({
+          dataId: snapshot.workspaceDataId,
+          version: snapshot.workspaceVersion,
+          selectedIds: snapshot.result.selectedIds,
+          jobs,
+          capacity: snapshot.capacity,
+          calendar: snapshot.capacityCalendar,
+        });
+        const verdict = verifyWitnessAgainstSnapshot(witness, snapshot, jobs);
+        if (!verdict.ok) {
+          return { witness: null, error: verdict.reason };
+        }
+        return { witness, error: null };
+      } catch (err) {
+        return {
+          witness: null,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+    [snapshot, jobs, stale],
+  );
+  const witness = witnessState.witness;
+
   // 采纳来源必须是当前版本的成功结果：过期/计算中/失败均不允许。
   const adoptable =
     snapshot !== null &&
@@ -60,10 +106,13 @@ export function ResultPanel({
     !status.computing &&
     snapshot.result.selectedCount > 0;
 
+  // 下载必须携带与页面同一份、且已核对配套的见证；见证缺失/失败时
+  // buildResultJson 的内部闸门与按钮 disabled 双重拦截，不会发出
+  // 不含见证的“看似成功”结果文件。
   const download = useMemo(() => {
-    if (!snapshot) return null;
+    if (!snapshot || !witness) return null;
     return () => {
-      const payload = buildResultJson(snapshot, reference, diff);
+      const payload = buildResultJson(snapshot, reference, diff, witness);
       const blob = new Blob([JSON.stringify(payload, null, 2)], {
         type: 'application/json',
       });
@@ -74,7 +123,7 @@ export function ResultPanel({
       a.click();
       URL.revokeObjectURL(url);
     };
-  }, [snapshot, reference, diff]);
+  }, [snapshot, reference, diff, witness]);
 
   return (
     <section className="panel result-panel">
@@ -96,7 +145,17 @@ export function ResultPanel({
           >
             采纳为参考方案
           </button>
-          <button onClick={() => download?.()} disabled={!snapshot || status.computing}>
+          <button
+            onClick={() => download?.()}
+            disabled={!snapshot || stale || !witness || status.computing}
+            title={
+              stale
+                ? '结果已过期：请先重新计算，再下载附带容量占用见证的当前结果'
+                : witnessState.error
+                  ? `见证不可用：${witnessState.error}`
+                  : '下载文件与页面使用同一份容量占用见证'
+            }
+          >
             下载结果 JSON
           </button>
         </div>
@@ -161,7 +220,24 @@ export function ResultPanel({
             )}
           </div>
           {diff && reference && <ReferenceChanges diff={diff} snapshot={snapshot} reference={reference} />}
-          <SelectedIds snapshot={snapshot} reference={reference} diff={diff} />
+          {stale && (
+            <div className="info-box" data-testid="stale-witness-note">
+              过期结果不生成容量占用见证、也不可下载：点击“重新计算”取得当前版本结果后，
+              方可逐段核对占用并下载（下载 JSON 与页面使用同一份见证）。
+            </div>
+          )}
+          {witnessState.error && (
+            <div className="error-box" role="alert">
+              容量占用见证生成/核对失败：{witnessState.error}
+              <div className="hint">
+                该结果不附带可信见证，下载已禁用；请重新计算，切勿将其作为当前排程下发。
+              </div>
+            </div>
+          )}
+          {witness && snapshot && (
+            <WitnessPanel witness={witness} jobs={jobs} onLocateJob={onLocateJob} />
+          )}
+          <SelectedIds snapshot={snapshot} reference={reference} diff={diff} witness={witness} />
         </div>
       )}
     </section>
@@ -274,13 +350,15 @@ function SelectedIds({
   snapshot,
   reference,
   diff,
+  witness,
 }: {
   snapshot: StoredSnapshot;
   reference: ReferencePlan | null;
   diff: ReferenceDiff | null;
+  witness: CapacityWitness | null;
 }) {
   const ids = snapshot.result.selectedIds;
-  const jsonPayload = buildResultJson(snapshot, reference, diff);
+  const jsonPayload = buildResultJson(snapshot, reference, diff, witness);
   const jsonIds = jsonPayload.selectedIds;
   // 屏幕集合与下载一致性断言（同数据源，正常情况下恒等）
   const consistent = ids.length === jsonIds.length && ids.every((v, i) => v === jsonIds[i]);

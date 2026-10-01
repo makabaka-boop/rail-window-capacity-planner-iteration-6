@@ -3,10 +3,19 @@ import type { Job, JobStatus } from '../core/types';
 
 export type StatusFilter = 'all' | JobStatus | 'selected';
 
+/** 外部（容量占用见证）请求在作业表中定位某作业 */
+export interface LocateRequest {
+  id: string;
+  /** 单调递增的请求序号：即使 id 相同也能重复触发 */
+  nonce: number;
+}
+
 interface Props {
   jobs: Job[];
   selectedIds: Set<string> | null;
   onChangeStatus: (jobIndex: number, next: JobStatus) => void;
+  /** 见证片段内点击作业时，把该作业定位（过滤）到作业表 */
+  locateRequest?: LocateRequest | null;
 }
 
 const ROW_HEIGHT = 34;
@@ -18,12 +27,21 @@ const OVERSCAN = 8;
  *  - 可按状态 / 关键字 / 是否入选过滤
  *  - 每行可在 普通 / 必选 / 排除 间切换；必选被拒绝时由父组件提示
  */
-export function JobsTable({ jobs, selectedIds, onChangeStatus }: Props) {
+export function JobsTable({ jobs, selectedIds, onChangeStatus, locateRequest }: Props) {
   const [filter, setFilter] = useState<StatusFilter>('all');
   const [keyword, setKeyword] = useState('');
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportH, setViewportH] = useState(520);
+
+  // 来自容量占用见证的定位请求：按 id 过滤并把该作业滚到可视区
+  useEffect(() => {
+    if (!locateRequest) return;
+    setFilter('all');
+    setKeyword(locateRequest.id);
+    setScrollTop(0);
+    scrollRef.current?.scrollTo({ top: 0 });
+  }, [locateRequest]);
 
   const filtered = useMemo(() => {
     const kw = keyword.trim();
